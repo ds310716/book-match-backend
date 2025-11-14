@@ -47,6 +47,7 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/books', booksRoutes);
 app.use('/api/match', matchRoutes);
+app.use('/api/notifications', require('./routes/notifications'));
 
 // Socket.IO 認證
 io.use(async (socket, next) => {
