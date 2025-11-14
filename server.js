@@ -1,62 +1,42 @@
-require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
 const http = require('http');
-const socketIo = require('socket.io');
-const jwt = require('jsonwebtoken');
+const { Server } = require('socket.io');
+const cors = require('cors');
 const supabase = require('./config/supabase');
-
-const authRoutes = require('./routes/auth');
-const booksRoutes = require('./routes/books');
-const matchRoutes = require('./routes/match');
 
 const app = express();
 const server = http.createServer(app);
 
-// Socket.IO 配置 - 允許 Vercel 前端連接
-const io = socketIo(server, {
-  cors: {
-    origin: process.env.FRONTEND_URL || "*",
-    methods: ["GET", "POST"],
-    credentials: true
-  }
-});
-
-// CORS 配置
+// CORS 設定
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "*",
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
   credentials: true
 }));
 
 app.use(express.json());
 
-// 健康檢查端點（Render 需要）
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: '書籍配對聊天室 API',
-    version: '1.0.0'
-  });
+// Socket.IO 設定
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    methods: ['GET', 'POST'],
+    credentials: true
+  }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy' });
-});
-
-// API 路由
-app.use('/api/auth', authRoutes);
-app.use('/api/books', booksRoutes);
-app.use('/api/match', matchRoutes);
-app.use('/api/notifications', require('./routes/notifications'));
-
-// Socket.IO 認證
+// Socket.IO 認證中間件
 io.use(async (socket, next) => {
   try {
     const token = socket.handshake.auth.token;
+    
     if (!token) {
       return next(new Error('認證失敗'));
     }
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+
+    // 驗證 JWT token
+    const jwt = require('jsonwebtoken');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    
     socket.userId = decoded.userId;
     next();
   } catch (error) {
@@ -64,76 +44,138 @@ io.use(async (socket, next) => {
   }
 });
 
-// Socket.IO 事件處理
+// Socket.IO 連線處理
 io.on('connection', (socket) => {
-  console.log('使用者連線:', socket.userId);
+  console.log('使用者連線:', socket.id, 'User ID:', socket.userId);
+  
+  // 使用者加入自己的個人房間（用於接收個人通知）
+  if (socket.userId) {
+    socket.join(`user-${socket.userId}`);
+    console.log(`✅ 使用者 ${socket.userId} 加入個人通知房間`);
+  }
 
+  // 加入聊天室
   socket.on('join-room', (roomId) => {
     socket.join(roomId);
     console.log(`使用者 ${socket.userId} 加入聊天室 ${roomId}`);
   });
 
+  // 離開聊天室
+  socket.on('leave-room', (roomId) => {
+    socket.leave(roomId);
+    console.log(`使用者 ${socket.userId} 離開聊天室 ${roomId}`);
+  });
+
+  // 發送訊息
   socket.on('send-message', async (data) => {
     try {
       const { roomId, message } = data;
 
-      // 驗證使用者是否為聊天室參與者
-      const { data: participation } = await supabase
-        .from('chat_room_participants')
-        .select('id')
-        .eq('chat_room_id', roomId)
-        .eq('user_id', socket.userId)
-        .single();
-
-      if (!participation) {
-        return socket.emit('error', { message: '你不在這個聊天室中' });
-      }
-
       // 儲存訊息到資料庫
-      const { data: newMessage, error } = await supabase
+      const { data: newMessage, error: messageError } = await supabase
         .from('messages')
-        .insert([
-          {
-            chat_room_id: roomId,
-            sender_id: socket.userId,
-            content: message
-          }
-        ])
+        .insert([{
+          chat_room_id: roomId,
+          sender_id: socket.userId,
+          content: message
+        }])
         .select(`
-          id,
-          content,
-          created_at,
-          sender:users!messages_sender_id_fkey (id, username)
+          *,
+          sender:users(id, username)
         `)
         .single();
 
-      if (error) throw error;
+      if (messageError) throw messageError;
 
-      // 廣播訊息給聊天室所有成員
+      // 發送訊息給聊天室所有人
       io.to(roomId).emit('new-message', {
-        roomId,
-        message: {
-          id: newMessage.id,
-          sender: newMessage.sender,
-          content: newMessage.content,
-          timestamp: newMessage.created_at
-        }
+        message: newMessage,
+        roomId
       });
+
+      console.log(`✅ 訊息已發送到聊天室 ${roomId}`);
+
+      // ===== 新增：創建通知並推送 =====
+      
+      // 1. 找出聊天室的另一個參與者
+      const { data: participants, error: participantsError } = await supabase
+        .from('chat_room_participants')
+        .select('user_id, users(username, email)')
+        .eq('chat_room_id', roomId)
+        .neq('user_id', socket.userId);
+
+      if (participantsError) {
+        console.error('查詢參與者失敗:', participantsError);
+        return;
+      }
+
+      if (participants && participants.length > 0) {
+        const recipient = participants[0];
+        const recipientId = recipient.user_id;
+
+        // 2. 取得發送者資訊
+        const { data: sender } = await supabase
+          .from('users')
+          .select('username')
+          .eq('id', socket.userId)
+          .single();
+
+        // 3. 創建通知
+        const messagePreview = message.length > 50 
+          ? message.substring(0, 50) + '...' 
+          : message;
+
+        const { data: notification, error: notifError } = await supabase
+          .from('notifications')
+          .insert([{
+            user_id: recipientId,
+            type: 'new_message',
+            title: '新訊息',
+            content: `${sender?.username || '使用者'}: ${messagePreview}`,
+            related_id: roomId,
+            link: `/chats/${roomId}`
+          }])
+          .select()
+          .single();
+
+        if (notifError) {
+          console.error('創建通知失敗:', notifError);
+          return;
+        }
+
+        // 4. 透過 Socket 推送通知給接收者
+        io.to(`user-${recipientId}`).emit('new-notification', notification);
+        
+        console.log(`✅ 新訊息通知已發送給使用者 ${recipientId}`);
+      }
+
     } catch (error) {
       console.error('發送訊息錯誤:', error);
       socket.emit('error', { message: '發送訊息失敗' });
     }
   });
 
+  // 使用者斷線
   socket.on('disconnect', () => {
-    console.log('使用者離線:', socket.userId);
+    console.log('使用者斷線:', socket.id);
   });
 });
 
-// 錯誤處理
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ error: '伺服器錯誤' });
+// 路由
+app.use('/api/auth', require('./routes/auth'));
+app.use('/api/books', (req, res, next) => {
+  req.io = io;  // 將 io 傳遞給 books 路由
+  next();
+}, require('./routes/books'));
+app.use('/api/match', (req, res, next) => {
+  req.io = io;  // 將 io 傳遞給 match 路由
+  next();
+}, require('./routes/match'));
+app.use('/api/notifications', require('./routes/notifications'));
+
+// 健康檢查
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy' });
 });
 
 // 啟動伺服器
@@ -141,3 +183,5 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`伺服器運行在 port ${PORT}`);
 });
+
+module.exports = { app, server, io };
