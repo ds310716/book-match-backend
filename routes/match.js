@@ -4,7 +4,6 @@ const auth = require('../middleware/auth');
 
 const router = express.Router();
 
-// 尋找配對的共用邏輯
 async function findMatches(userId) {
   const { data: userBooks, error: booksError } = await supabase
     .from('books')
@@ -66,7 +65,6 @@ async function findMatches(userId) {
   return matchArray;
 }
 
-// 尋找配對 - 原有路徑
 router.get('/find', auth, async (req, res) => {
   try {
     const matches = await findMatches(req.userId);
@@ -77,7 +75,6 @@ router.get('/find', auth, async (req, res) => {
   }
 });
 
-// 尋找配對 - 新路徑（前端使用）
 router.get('/find-matches', auth, async (req, res) => {
   try {
     const matches = await findMatches(req.userId);
@@ -88,7 +85,6 @@ router.get('/find-matches', auth, async (req, res) => {
   }
 });
 
-// 建立或取得聊天室
 router.post('/chat-room', auth, async (req, res) => {
   try {
     const { targetUserId } = req.body;
@@ -131,7 +127,7 @@ router.post('/chat-room', auth, async (req, res) => {
               user_id,
               users(id, username, email)
             ),
-            matched_books:chat_room_matched_books(
+            matched_books:chat_room_books(
               book:books(title, author)
             )
           `)
@@ -187,7 +183,7 @@ router.post('/chat-room', auth, async (req, res) => {
       }));
 
       await supabase
-        .from('chat_room_matched_books')
+        .from('chat_room_books')
         .insert(matchedBooksData);
     }
 
@@ -199,7 +195,7 @@ router.post('/chat-room', auth, async (req, res) => {
           user_id,
           users(id, username, email)
         ),
-        matched_books:chat_room_matched_books(
+        matched_books:chat_room_books(
           book:books(title, author)
         )
       `)
@@ -243,7 +239,6 @@ router.post('/chat-room', auth, async (req, res) => {
   }
 });
 
-// 取得聊天室詳情
 router.get('/chat-room/:roomId', auth, async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -268,7 +263,7 @@ router.get('/chat-room/:roomId', auth, async (req, res) => {
           user_id,
           users(id, username, email)
         ),
-        matched_books:chat_room_matched_books(
+        matched_books:chat_room_books(
           book:books(title, author)
         ),
         messages(
@@ -296,7 +291,6 @@ router.get('/chat-room/:roomId', auth, async (req, res) => {
   }
 });
 
-// 取得使用者的所有聊天室
 router.get('/chat-rooms', auth, async (req, res) => {
   try {
     const userId = req.userId;
@@ -322,7 +316,7 @@ router.get('/chat-rooms', auth, async (req, res) => {
           user_id,
           users(id, username, email)
         ),
-        matched_books:chat_room_matched_books(
+        matched_books:chat_room_books(
           book:books(title, author)
         ),
         messages(
