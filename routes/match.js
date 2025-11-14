@@ -5,58 +5,72 @@ const auth = require('../middleware/auth');
 const router = express.Router();
 
 // 尋找配對
-router.get('/find-matches', auth, async (req, res) => {
+router.get('/find', auth, async (req, res) => {
   try {
-    // 取得當前使用者的書籍
-    const { data: myBooks, error: myBooksError } = await supabase
+    const userId = req.userId;
+
+    // 取得使用者的所有書籍
+    const { data: userBooks, error: booksError } = await supabase
       .from('books')
       .select('title, author')
-      .eq('user_id', req.userId);
+      .eq('user_id', userId);
 
-    if (myBooksError) throw myBooksError;
+    if (booksError) throw booksError;
 
-    if (!myBooks || myBooks.length === 0) {
+    if (!userBooks || userBooks.length === 0) {
       return res.json({ matches: [] });
     }
 
-    // 取得所有其他使用者
-    const { data: otherUsers, error: usersError } = await supabase
-      .from('users')
-      .select('id, username')
-      .neq('id', req.userId);
+    // 找出有相同書籍的其他使用者
+    const matches = new Map();
 
-    if (usersError) throw usersError;
+    for (const book of userBooks) {
+      const { data: matchedUsers, error: matchError } = await supabase
+        .from('books')
+        .select(`
+          user_id,
+          title,
+          author,
+          users (
+            id,
+            username,
+            email
+          )
+        `)
+        .eq('title', book.title)
+        .eq('author', book.author)
+        .neq('user_id', userId);
 
-    // 取得所有其他使用者的書籍
-    const { data: allBooks, error: allBooksError } = await supabase
-      .from('books')
-      .select('user_id, title, author')
-      .neq('user_id', req.userId);
+      if (matchError) throw matchError;
 
-    if (allBooksError) throw allBooksError;
+      if (matchedUsers) {
+        matchedUsers.forEach(match => {
+          const matchUserId = match.user_id;
+          if (!matches.has(matchUserId)) {
+            matches.set(matchUserId, {
+              userId: matchUserId,
+              username: match.users.username,
+              email: match.users.email,
+              commonBooks: [],
+              matchCount: 0
+            });
+          }
+          
+          matches.get(matchUserId).commonBooks.push({
+            title: match.title,
+            author: match.author
+          });
+          matches.get(matchUserId).matchCount++;
+        });
+      }
+    }
 
-    // 計算配對
-    const matches = otherUsers.map(user => {
-      const userBooks = allBooks.filter(book => book.user_id === user.id);
-      
-      const commonBooks = myBooks.filter(myBook =>
-        userBooks.some(theirBook => 
-          myBook.title.toLowerCase() === theirBook.title.toLowerCase()
-        )
-      );
-
-      return {
-        userId: user.id,
-        username: user.username,
-        commonBooks: commonBooks.map(b => ({ title: b.title, author: b.author })),
-        matchCount: commonBooks.length
-      };
-    }).filter(match => match.matchCount > 0)
+    const matchArray = Array.from(matches.values())
       .sort((a, b) => b.matchCount - a.matchCount);
 
-    res.json({ matches });
+    res.json({ matches: matchArray });
   } catch (error) {
-    console.error('尋找配對錯誤:', error);
+    console.error('尋找配對失敗:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -65,89 +79,220 @@ router.get('/find-matches', auth, async (req, res) => {
 router.post('/chat-room', auth, async (req, res) => {
   try {
     const { targetUserId } = req.body;
-    const currentUserId = req.userId;
+    const userId = req.userId;
+
+    if (!targetUserId) {
+      return res.status(400).json({ error: '缺少目標使用者 ID' });
+    }
+
+    if (targetUserId === userId) {
+      return res.status(400).json({ error: '無法與自己建立聊天室' });
+    }
 
     // 檢查是否已存在聊天室
-    const { data: existingRooms, error: searchError } = await supabase
+    const { data: existingRooms, error: checkError } = await supabase
       .from('chat_room_participants')
       .select('chat_room_id')
-      .eq('user_id', currentUserId);
+      .eq('user_id', userId);
 
-    if (searchError) throw searchError;
-
-    let chatRoomId = null;
+    if (checkError) throw checkError;
 
     if (existingRooms && existingRooms.length > 0) {
       const roomIds = existingRooms.map(r => r.chat_room_id);
       
-      const { data: targetRooms } = await supabase
+      const { data: targetRooms, error: targetError } = await supabase
         .from('chat_room_participants')
         .select('chat_room_id')
         .eq('user_id', targetUserId)
         .in('chat_room_id', roomIds);
 
+      if (targetError) throw targetError;
+
       if (targetRooms && targetRooms.length > 0) {
-        chatRoomId = targetRooms[0].chat_room_id;
+        const existingRoomId = targetRooms[0].chat_room_id;
+        
+        const { data: existingRoom, error: roomError } = await supabase
+          .from('chat_rooms')
+          .select(`
+            *,
+            participants:chat_room_participants(
+              user_id,
+              users(id, username, email)
+            ),
+            matched_books:chat_room_matched_books(
+              book:books(title, author)
+            )
+          `)
+          .eq('id', existingRoomId)
+          .single();
+
+        if (roomError) throw roomError;
+
+        return res.json({
+          message: '聊天室已存在',
+          chatRoom: existingRoom
+        });
       }
     }
 
-    // 如果沒有現有聊天室，創建新的
-    if (!chatRoomId) {
-      // 創建聊天室
-      const { data: newRoom, error: roomError } = await supabase
-        .from('chat_rooms')
-        .insert([{}])
-        .select()
-        .single();
+    // 找出共同書籍
+    const { data: userBooks } = await supabase
+      .from('books')
+      .select('id, title, author')
+      .eq('user_id', userId);
 
-      if (roomError) throw roomError;
-      chatRoomId = newRoom.id;
+    const { data: targetBooks } = await supabase
+      .from('books')
+      .select('id, title, author')
+      .eq('user_id', targetUserId);
 
-      // 添加參與者
-      const { error: participantsError } = await supabase
-        .from('chat_room_participants')
-        .insert([
-          { chat_room_id: chatRoomId, user_id: currentUserId },
-          { chat_room_id: chatRoomId, user_id: targetUserId }
-        ]);
+    const commonBooks = userBooks?.filter(userBook =>
+      targetBooks?.some(targetBook =>
+        targetBook.title === userBook.title && targetBook.author === userBook.author
+      )
+    ) || [];
 
-      if (participantsError) throw participantsError;
+    // 建立新聊天室
+    const { data: chatRoom, error: createError } = await supabase
+      .from('chat_rooms')
+      .insert([{}])
+      .select()
+      .single();
 
-      // 計算並儲存共同書籍
-      const { data: myBooks } = await supabase
-        .from('books')
-        .select('title, author')
-        .eq('user_id', currentUserId);
+    if (createError) throw createError;
 
-      const { data: theirBooks } = await supabase
-        .from('books')
-        .select('title, author')
-        .eq('user_id', targetUserId);
+    // 加入參與者
+    const { error: participantsError } = await supabase
+      .from('chat_room_participants')
+      .insert([
+        { chat_room_id: chatRoom.id, user_id: userId },
+        { chat_room_id: chatRoom.id, user_id: targetUserId }
+      ]);
 
-      const commonBooks = myBooks.filter(myBook =>
-        theirBooks.some(theirBook => 
-          myBook.title.toLowerCase() === theirBook.title.toLowerCase()
-        )
-      );
+    if (participantsError) throw participantsError;
 
-      if (commonBooks.length > 0) {
-        await supabase
-          .from('chat_room_books')
-          .insert(
-            commonBooks.map(book => ({
-              chat_room_id: chatRoomId,
-              title: book.title,
-              author: book.author
-            }))
-          );
-      }
+    // 加入共同書籍
+    if (commonBooks.length > 0) {
+      const matchedBooksData = commonBooks.map(book => ({
+        chat_room_id: chatRoom.id,
+        book_id: book.id
+      }));
+
+      await supabase
+        .from('chat_room_matched_books')
+        .insert(matchedBooksData);
     }
 
     // 取得完整的聊天室資訊
-    const chatRoom = await getChatRoomDetails(chatRoomId);
+    const { data: fullChatRoom, error: fullRoomError } = await supabase
+      .from('chat_rooms')
+      .select(`
+        *,
+        participants:chat_room_participants(
+          user_id,
+          users(id, username, email)
+        ),
+        matched_books:chat_room_matched_books(
+          book:books(title, author)
+        )
+      `)
+      .eq('id', chatRoom.id)
+      .single();
+
+    if (fullRoomError) throw fullRoomError;
+
+    // ===== 新增：創建通知給對方 =====
+    
+    // 取得當前使用者資訊
+    const { data: currentUser } = await supabase
+      .from('users')
+      .select('username')
+      .eq('id', userId)
+      .single();
+
+    // 創建「開啟聊天」通知給對方
+    const { data: notification } = await supabase
+      .from('notifications')
+      .insert([{
+        user_id: targetUserId,
+        type: 'chat_opened',
+        title: '新的聊天室',
+        content: `${currentUser?.username || '使用者'} 開啟了與您的聊天室`,
+        related_id: chatRoom.id,
+        link: `/chats/${chatRoom.id}`
+      }])
+      .select()
+      .single();
+
+    // 透過 Socket.IO 推送通知
+    if (notification && req.io) {
+      req.io.to(`user-${targetUserId}`).emit('new-notification', notification);
+      console.log(`✅ 聊天室通知已發送給使用者 ${targetUserId}`);
+    }
+
+    res.json({
+      message: '聊天室已建立',
+      chatRoom: fullChatRoom
+    });
+
+  } catch (error) {
+    console.error('建立聊天室失敗:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// 取得聊天室詳情
+router.get('/chat-room/:roomId', auth, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const userId = req.userId;
+
+    // 檢查使用者是否為聊天室成員
+    const { data: participant, error: checkError } = await supabase
+      .from('chat_room_participants')
+      .select('*')
+      .eq('chat_room_id', roomId)
+      .eq('user_id', userId)
+      .single();
+
+    if (checkError || !participant) {
+      return res.status(403).json({ error: '無權訪問此聊天室' });
+    }
+
+    // 取得聊天室資訊
+    const { data: chatRoom, error: roomError } = await supabase
+      .from('chat_rooms')
+      .select(`
+        *,
+        participants:chat_room_participants(
+          user_id,
+          users(id, username, email)
+        ),
+        matched_books:chat_room_matched_books(
+          book:books(title, author)
+        ),
+        messages(
+          id,
+          content,
+          created_at,
+          sender:users(id, username)
+        )
+      `)
+      .eq('id', roomId)
+      .single();
+
+    if (roomError) throw roomError;
+
+    // 排序訊息
+    if (chatRoom.messages) {
+      chatRoom.messages.sort((a, b) => 
+        new Date(a.created_at) - new Date(b.created_at)
+      );
+    }
+
     res.json({ chatRoom });
   } catch (error) {
-    console.error('建立聊天室錯誤:', error);
+    console.error('取得聊天室失敗:', error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -155,90 +300,63 @@ router.post('/chat-room', auth, async (req, res) => {
 // 取得使用者的所有聊天室
 router.get('/chat-rooms', auth, async (req, res) => {
   try {
-    // 取得使用者參與的聊天室
-    const { data: participations, error: partError } = await supabase
+    const userId = req.userId;
+
+    const { data: userRooms, error: roomsError } = await supabase
       .from('chat_room_participants')
       .select('chat_room_id')
-      .eq('user_id', req.userId);
+      .eq('user_id', userId);
 
-    if (partError) throw partError;
+    if (roomsError) throw roomsError;
 
-    if (!participations || participations.length === 0) {
+    if (!userRooms || userRooms.length === 0) {
       return res.json({ chatRooms: [] });
     }
 
-    const roomIds = participations.map(p => p.chat_room_id);
+    const roomIds = userRooms.map(r => r.chat_room_id);
 
-    // 取得所有聊天室的詳細資訊
-    const chatRooms = await Promise.all(
-      roomIds.map(roomId => getChatRoomDetails(roomId))
-    );
+    const { data: chatRooms, error: detailsError } = await supabase
+      .from('chat_rooms')
+      .select(`
+        *,
+        participants:chat_room_participants(
+          user_id,
+          users(id, username, email)
+        ),
+        matched_books:chat_room_matched_books(
+          book:books(title, author)
+        ),
+        messages(
+          id,
+          content,
+          created_at,
+          sender:users(id, username)
+        )
+      `)
+      .in('id', roomIds)
+      .order('updated_at', { ascending: false });
 
-    res.json({ chatRooms });
+    if (detailsError) throw detailsError;
+
+    // 為每個聊天室取得最後一則訊息
+    const chatRoomsWithLastMessage = chatRooms?.map(room => {
+      const lastMessage = room.messages && room.messages.length > 0
+        ? room.messages.sort((a, b) => 
+            new Date(b.created_at) - new Date(a.created_at)
+          )[0]
+        : null;
+
+      return {
+        ...room,
+        lastMessage
+      };
+    }) || [];
+
+    res.json({ chatRooms: chatRoomsWithLastMessage });
   } catch (error) {
-    console.error('取得聊天室錯誤:', error);
+    console.error('取得聊天室列表失敗:', error);
     res.status(400).json({ error: error.message });
   }
 });
-
-// 取得特定聊天室
-router.get('/chat-room/:roomId', auth, async (req, res) => {
-  try {
-    // 驗證使用者是否為參與者
-    const { data: participation } = await supabase
-      .from('chat_room_participants')
-      .select('id')
-      .eq('chat_room_id', req.params.roomId)
-      .eq('user_id', req.userId)
-      .single();
-
-    if (!participation) {
-      return res.status(404).json({ error: '找不到聊天室' });
-    }
-
-    const chatRoom = await getChatRoomDetails(req.params.roomId);
-    res.json({ chatRoom });
-  } catch (error) {
-    console.error('取得聊天室詳情錯誤:', error);
-    res.status(400).json({ error: error.message });
-  }
-});
-
-// 輔助函數：取得聊天室完整資訊
-async function getChatRoomDetails(roomId) {
-  // 取得參與者
-  const { data: participants } = await supabase
-    .from('chat_room_participants')
-    .select(`
-      user_id,
-      users (id, username)
-    `)
-    .eq('chat_room_id', roomId);
-
-  // 取得配對書籍
-  const { data: matchedBooks } = await supabase
-    .from('chat_room_books')
-    .select('title, author')
-    .eq('chat_room_id', roomId);
-
-  // 取得訊息
-  const { data: messages } = await supabase
-    .from('messages')
-    .select(`
-      id,
-      content,
-      created_at,
-      sender:users!messages_sender_id_fkey (id, username)
-    `)
-    .eq('chat_room_id', roomId)
-    .order('created_at', { ascending: true });
-
-  return {
-    id: roomId,
-    participants: participants.map(p => p.users),
-    matchedBooks: matchedBooks || [],
-    messages: messages || []
-  };
-}
 
 module.exports = router;
